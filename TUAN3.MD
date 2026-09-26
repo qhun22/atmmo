@@ -718,3 +718,621 @@ VALUES
     ('TEST-EID-001','T1','A','A','1',2026,1,1);
 -- Kỳ vọng: lỗi UNIQUE violation do eid='TEST-EID-001' đã tồn tại.
 ```
+
+---
+
+## 7. THIẾT KẾ KIẾN TRÚC HỆ THỐNG (SYSTEM ARCHITECTURE)
+
+Hệ thống Scopus ICTU được thiết kế theo **mô hình 3 tầng** (Three-Tier Architecture) kết hợp **mô hình xử lý bất đồng bộ** cho pipeline parse + Match Score (FR-07 → FR-15) để đáp ứng NFR-03 (≤ 10 giây cho 660 bản ghi).
+
+### 7.1. Sơ đồ Kiến trúc kỹ thuật tổng thể
+
+```mermaid
+flowchart TB
+    subgraph ClientTier["🖥️  CLIENT TIER  —  Trình duyệt ICTU"]
+        UI["React SPA<br/>(Vite + React 18)"]
+        Style["TailwindCSS"]
+        HTTP["Axios HTTP Client<br/>(JWT Bearer + CSRF)"]
+        UI --> Style
+        UI --> HTTP
+    end
+
+    subgraph EdgeTier["🌐  EDGE / REVERSE PROXY"]
+        Nginx["Nginx<br/>TLS + Static Assets"]
+    end
+
+    subgraph AppTier["⚙️  APPLICATION TIER  —  FastAPI Backend"]
+        API["FastAPI Router<br/>(OpenAPI/Swagger UI)"]
+        Auth["Auth Middleware<br/>JWT + RBAC"]
+        UploadCtrl["Upload Controller<br/>multipart/form-data"]
+        ApprovalCtrl["Approval Controller<br/>Diff View + Evidence"]
+        ExportCtrl["Export Controller<br/>Excel / CSV / JSON"]
+        AuditCtrl["Audit Service<br/>Bất biến log"]
+        HTTP --> Nginx
+        Nginx --> API
+        API --> Auth
+        Auth --> UploadCtrl
+        Auth --> ApprovalCtrl
+        Auth --> ExportCtrl
+        Auth --> AuditCtrl
+    end
+
+    subgraph WorkerTier["🔄  BACKGROUND WORKER TIER"]
+        Broker["Redis / RabbitMQ<br/>Message Broker"]
+        Worker["Celery Worker / FastAPI BackgroundTasks<br/>Pipeline: Parse → Normalize → Match → Score"]
+        Worker --> Broker
+        UploadCtrl -.enqueue.-> Broker
+        Broker -.consume.-> Worker
+    end
+
+    subgraph DataTier["💾  DATA TIER"]
+        DB[("PostgreSQL 15<br/>schema scopus_ictu<br/>10 bảng")]
+        FS["File Storage<br/>(CSV gốc lưu trên ổ đĩa / S3)"]
+        AuditCtrl --> DB
+        Worker --> DB
+        Worker --> FS
+        UploadCtrl --> FS
+    end
+
+    subgraph External["🔗  HỆ THỐNG LIÊN THÔNG ICTU"]
+        SIS["Hệ thống chung ICTU<br/>(nhận JSON export)"]
+    end
+
+    ExportCtrl -.JSON Schema.-> SIS
+
+    classDef tierStyle fill:#EAF4FF,stroke:#1F6FEB,stroke-width:2px,color:#1A1A1A
+    classDef subStyle fill:#FFFFFF,stroke:#2C3E50,stroke-width:1px,color:#1A1A1A
+    classDef dbStyle fill:#FFF8E1,stroke:#B07A00,stroke-width:2px,color:#5A4500
+
+    class ClientTier,AppTier,WorkerTier,DataTier tierStyle
+    class UI,Style,HTTP,Nginx,API,Auth,UploadCtrl,ApprovalCtrl,ExportCtrl,AuditCtrl,Broker,Worker,FS,SIS subStyle
+    class DB dbStyle
+```
+
+### 7.2. Thuyết minh các tầng
+
+| Tầng | Công nghệ | Trách nhiệm chính | Liên hệ tới FR/NFR |
+|---|---|---|---|
+| **Client Tier** | React 18 + Vite + TailwindCSS + Axios | Giao diện người dùng; gọi REST API qua HTTP kèm JWT Bearer token và CSRF token. | Tất cả FR có UI; NFR-04 (gửi token đúng role) |
+| **Edge / Reverse Proxy** | Nginx | TLS termination, phục vụ static assets, rate limiting. | NFR-04 (bảo mật) |
+| **Application Tier** | FastAPI (Python 3.11+) + SQLAlchemy + Pydantic | Xử lý nghiệp vụ đồng bộ: upload, đối soát, phê duyệt, xuất báo cáo. | FR-01 → FR-29; NFR-01 → NFR-05 |
+| **Background Worker Tier** | Celery (Python) hoặc FastAPI BackgroundTasks + Redis/RabbitMQ | Pipeline bất đồng bộ: parse tác giả (FR-07), chuẩn hoá tên (FR-08), đối soát GV (FR-10, FR-11), tính Match Score (FR-12), ghi `approval_queue` (FR-14). | NFR-03 (≤ 10 giây) |
+| **Data Tier** | PostgreSQL 15 + File Storage (Local FS / S3) | Lưu 10 bảng nghiệp vụ + file CSV gốc để audit lại. | NFR-01 (Idempotency), NFR-02 (Auditability) |
+| **External** | Hệ thống chung ICTU | Tiêu thụ file JSON xuất từ API, validate theo JSON Schema công bố. | NFR-05 (Interoperability) |
+
+### 7.3. Đặc tả Web API RESTful
+
+Danh mục API dưới đây tuân thủ chuẩn REST, OpenAPI 3.1, sử dụng mã trạng thái HTTP chuẩn. Tất cả endpoint (trừ `/auth/login`) yêu cầu `Authorization: Bearer <jwt>` và CSRF token ở header.
+
+**Chú thích cột RBAC:** `Op` = Operator, `Adm` = Admin.
+
+#### 7.3.1. Authentication
+
+| Endpoint | Method | Tóm tắt | RBAC | Request | Response |
+|---|---|---|---|---|---|
+| `/api/v1/auth/login` | POST | Đăng nhập, trả JWT access + refresh | Public | Body: `{username, password}` | 200 `{access_token, refresh_token, role}` / 401 |
+| `/api/v1/auth/refresh` | POST | Refresh JWT | Authenticated | Body: `{refresh_token}` | 200 `{access_token}` / 401 |
+| `/api/v1/auth/logout` | POST | Đăng xuất, thu hồi token | Authenticated | — | 204 |
+
+#### 7.3.2. Upload & Quản lý Lô nhập (FR-01 → FR-06)
+
+| Endpoint | Method | Tóm tắt | RBAC | Request | Response |
+|---|---|---|---|---|---|
+| `/api/v1/uploads` | POST | Upload tệp Scopus CSV (multipart) | Op, Adm | Form: `file` (binary ≤ 50 MB, UTF-8) | 201 `{batch_id, total_rows, correlation_id}` / 400 SCHEMA_INVALID / 403 |
+| `/api/v1/uploads` | GET | Liệt kê các lô nhập (phân trang) | Op, Adm | Query: `?status=&page=&size=` | 200 `[{batch_id, file_name, total_rows, new_rows, duplicate_rows, warning_rows, uploaded_at, processing_status}]` |
+| `/api/v1/uploads/{batch_id}` | GET | Chi tiết 1 lô nhập | Op, Adm | — | 200 `{batch_id, ...}` / 404 |
+| `/api/v1/uploads/{batch_id}/raw` | GET | Lấy danh sách bản ghi thuộc lô | Op, Adm | Query: `?duplicate=&warning=&page=&size=` | 200 `[{raw_id, eid, title, year, doi, document_type, duplicate, warning_reasons}]` |
+
+#### 7.3.3. Lecturers Management (FR-22)
+
+| Endpoint | Method | Tóm tắt | RBAC | Request | Response |
+|---|---|---|---|---|---|
+| `/api/v1/lecturers` | GET | Danh sách GV ICTU (phân trang, tìm kiếm) | Op, Adm | Query: `?q=&faculty=&is_active=&page=` | 200 `[{id, lecturer_code, full_name, scopus_author_id, faculty, is_active}]` |
+| `/api/v1/lecturers` | POST | Thêm GV mới | Adm | Body: `{lecturer_code, full_name, full_name_no_diacritics, scopus_author_id, affiliation, faculty, department, email}` | 201 `{id, ...}` / 400 / 409 (trùng lecturer_code hoặc scopus_author_id) |
+| `/api/v1/lecturers/{id}` | PUT | Cập nhật thông tin GV | Adm | Body: (các trường cho phép sửa) | 200 / 404 |
+| `/api/v1/lecturers/{id}` | DELETE | Soft-delete GV (set `is_active = false`) | Adm | — | 204 / 409 (đang có dữ liệu chuẩn hoá) |
+
+#### 7.3.4. Approval Queue (FR-13 → FR-19)
+
+| Endpoint | Method | Tóm tắt | RBAC | Request | Response |
+|---|---|---|---|---|---|
+| `/api/v1/approval-queue` | GET | Danh sách hàng đợi phê duyệt | Adm | Query: `?status=&retracted=&page=&size=` | 200 `[{queue_id, raw_id, author_extracted_id, candidate_lecturer_id, status, match_score, evidence_payload, is_retracted, is_erratum, created_at}]` |
+| `/api/v1/approval-queue/{queue_id}/diff` | GET | Lấy Diff View chi tiết 1 bản ghi | Adm | — | 200 `{before: {raw_author, normalized_name, ...}, after: {suggested_lecturer, score, evidence}, warnings: [...]}` / 404 |
+| `/api/v1/approval-queue/{queue_id}/approve` | POST | Phê duyệt liên kết (FR-17) | Adm | Body: `{correlation_id}` | 201 `{standardized_id, audit_log_id}` / 409 (đã duyệt) |
+| `/api/v1/approval-queue/{queue_id}/manual-assign` | POST | Gán tay giảng viên (FR-18) | Adm | Body: `{lecturer_id, correlation_id, reason}` | 201 `{standardized_id, audit_log_id}` / 400 / 404 |
+| `/api/v1/approval-queue/{queue_id}/defer` | POST | Chuyển chờ xác minh (FR-19) | Adm | Body: `{reason, correlation_id}` | 200 `{queue_id, status: PENDING_VERIFY}` / 404 |
+
+#### 7.3.5. Rollback (FR-20)
+
+| Endpoint | Method | Tóm tắt | RBAC | Request | Response |
+|---|---|---|---|---|---|
+| `/api/v1/standardized-data/{id}/rollback` | POST | Hoàn tác bản ghi đã duyệt (trong 72h) | Adm | Body: `{reason, correlation_id}` | 200 `{standardized_id, invalidated_at, audit_log_id}` / 409 (quá 72h) / 409 (đã rollback) |
+
+#### 7.3.6. Statistics & Export (FR-23 → FR-29)
+
+| Endpoint | Method | Tóm tắt | RBAC | Request | Response |
+|---|---|---|---|---|---|
+| `/api/v1/standardized-data` | GET | Lọc + tìm kiếm dữ liệu chuẩn hoá | Op, Adm | Query: `?year_from=&year_to=&faculty=&publisher_family=&status=&q=` | 200 `[{std_id, lecturer_id, raw_id, eid, title, year, score, approved_at, is_invalidated}]` |
+| `/api/v1/statistics/overview` | GET | Dashboard tổng quan (FR-25) | Op, Adm | Query: `?year=` | 200 `{total_papers, total_citations, top_authors: [...], top_publishers: [...], match_distribution: {HIGH, MEDIUM, PENDING}}` |
+| `/api/v1/exports` | POST | Yêu cầu xuất báo cáo (FR-26/27/28/29) | Op, Adm | Body: `{format: xlsx|csv|json, filter: {...}}` | 202 `{export_id, status: PROCESSING}` |
+| `/api/v1/exports/{export_id}` | GET | Kiểm tra trạng thái + tải file | Op, Adm | — | 200 `{status, file_name, file_hash_sha256, row_count, download_url}` |
+
+#### 7.3.7. Audit Logs (FR-21, NFR-02)
+
+| Endpoint | Method | Tóm tắt | RBAC | Request | Response |
+|---|---|---|---|---|---|
+| `/api/v1/audit-logs` | GET | Xem nhật ký kiểm toán | Adm | Query: `?actor_id=&action=&target_table=&from=&to=&page=` | 200 `[{id, action, actor_id, target_table, target_id, before_json, after_json, reason, correlation_id, created_at}]` |
+| `/api/v1/export-audit-logs` | GET | Xem lịch sử xuất báo cáo | Op (chỉ của mình), Adm (toàn bộ) | Query: `?actor_id=&from=&to=` | 200 `[{id, file_format, file_name, row_count, file_hash_sha256, filter_criteria_json, created_at}]` |
+
+#### 7.3.8. Mã trạng thái HTTP tiêu chuẩn dùng trong hệ thống
+
+| Mã | Ý nghĩa | Áp dụng cho |
+|---|---|---|
+| **200** | OK | GET thành công, POST cập nhật thành công |
+| **201** | Created | POST tạo mới (lecturer, standardized_data) |
+| **202** | Accepted | Yêu cầu xuất báo cáo đang xử lý async |
+| **204** | No Content | DELETE thành công |
+| **400** | Bad Request | Schema sai, validation fail, thiếu field bắt buộc |
+| **401** | Unauthorized | Token hết hạn hoặc không hợp lệ |
+| **403** | Forbidden | Không có quyền (ghi vào `security_audit_log`) |
+| **404** | Not Found | Không tìm thấy resource |
+| **409** | Conflict | Trùng UNIQUE, đã rollback, quá 72h |
+| **413** | Payload Too Large | File CSV > 50 MB |
+| **422** | Unprocessable Entity | Idempotency violation |
+
+---
+
+## 8. THIẾT KẾ GIAO DIỆN MẪU (UI WIREFRAME)
+
+Ba màn hình nghiệp vụ trọng tâm được phác thảo bằng **ASCII Wireframe** chi tiết, sử dụng ký tự an toàn (Unicode box-drawing) để hiển thị đúng trong mọi môi trường. Mỗi màn hình kèm theo bảng mô tả **Layout zone** và **Component chi tiết**.
+
+### 8.1. Màn hình 1 — Nhập liệu & Giám sát pipeline
+
+**Mục đích:** Cho phép Operator tải tệp CSV Scopus, theo dõi tiến trình xử lý và xem tổng quan kết quả lô nhập (FR-01 → FR-06).
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│ ICTU · Quản lý & Chuẩn hoá Scopus            Op: nguyen.vanA  [Đăng xuất]│
+├──────────────────────────────────────────────────────────────────────────┤
+│ [1 Upload]  [2 Approval Queue]  [3 Báo cáo]  [4 Audit Log]              │
+├──────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│   ┌──────────────────────────────────────────────────────────────┐      │
+│   │              📤  KÉO – THẢ HOẶC CHỌN TỆP CSV SCOPUS         │      │
+│   │                                                              │      │
+│   │         ┌────────────────────────────────────────┐           │      │
+│   │         │                                        │           │      │
+│   │         │      ⬇  Kéo tệp .csv vào đây  ⬇      │           │      │
+│   │         │                                        │           │      │
+│   │         │      hoặc [ Chọn tệp từ máy trạm ]   │           │      │
+│   │         └────────────────────────────────────────┘           │      │
+│   │                                                              │      │
+│   │  Yêu cầu: ≤ 50 MB · Encoding UTF-8 · 22 cột theo mẫu        │      │
+│   │                                  [ Tải template CSV chuẩn ]  │      │
+│   └──────────────────────────────────────────────────────────────┘      │
+│                                                                          │
+│   ┌─── LÔ NHẬP GẦN ĐÂY ──────────────────────────────────────────┐     │
+│   │  Tên tệp                Tổng   Mới   Trùng  Cảnh báo  TT    │     │
+│   │  ─────────────────      ────   ───   ─────  ─────────  ──    │     │
+│   │  Sep2026.csv            660    660    0      25        ✅     │     │
+│   │  Aug2026.csv            640    580   60      18        ✅     │     │
+│   │  Sep2026_resubmit.csv   660    0     660     25        ⚠️    │     │
+│   │  Jul2026_invalid.csv    —      —     —       —         ❌     │     │
+│   └───────────────────────────────────────────────────────────────┘     │
+│                                                                          │
+│   ┌─── THANH TIẾN TRÌNH LÔ HIỆN TẠI ─────────────────────────────┐     │
+│   │  [██████░░░░░░░░░░░░░░░░] 35%   ⏱  Còn ~3s                    │     │
+│   │  Bước: ST-05 Parse tác giả → ST-08 Exact Match → ST-12 Queue  │     │
+│   └───────────────────────────────────────────────────────────────┘     │
+│                                                                          │
+│   ┌─── KẾT QUẢ XỬ LÝ (Sau khi hoàn tất) ────────────────────────┐     │
+│   │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐       │     │
+│   │  │   660    │  │   660    │  │     0    │  │    25    │       │     │
+│   │  │  Tổng   │  │  Mới     │  │  Trùng   │  │ Cảnh báo │       │     │
+│   │  └──────────┘  └──────────┘  └──────────┘  └──────────┘       │     │
+│   │  [ Xem chi tiết bản ghi ]   [ Mở Approval Queue ]            │     │
+│   └───────────────────────────────────────────────────────────────┘     │
+│                                                                          │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+| Layout zone | Component | Hành vi / Trạng thái |
+|---|---|---|
+| Top bar | Logo + Tab điều hướng + User menu | 4 tab chính, tab 1 active |
+| Upload zone | Drag-and-drop area (dashed border) + Nút "Chọn tệp" + Link tải template | Validate client-side: extension `.csv`, size ≤ 50 MB |
+| Recent batches table | Bảng 5 cột: tên tệp, tổng, mới, trùng, cảnh báo, trạng thái | Click row → mở chi tiết batch ở panel dưới |
+| Progress bar | Thanh ngang có % + tên bước ST đang chạy | Subscribe WebSocket `/ws/pipeline/{correlation_id}` |
+| Result cards | 4 thẻ số liệu tổng hợp | Cập nhật realtime khi worker báo cáo từng giai đoạn |
+
+### 8.2. Màn hình 2 — Hàng đợi Đối soát & Phê duyệt (Diff View)
+
+**Mục đích:** Admin xem Diff trước/sau chuẩn hoá, quyết định Duyệt / Gán tay / Defer / Rollback (FR-16 → FR-20).
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│ ICTU · Approval Queue          Adm: tran.thiB  [Đăng xuất]                │
+├──────────────────────────────────────────────────────────────────────────┤
+│ [1 Upload]  [2 Approval Queue●]  [3 Báo cáo]  [4 Audit Log]              │
+├──────────────────────────────────────────────────────────────────────────┤
+│  Lọc: [▼ Status: HIGH ]  [▼ Năm: 2026 ]  [▼ Khoa: CNTT ]   Tìm: [____]  │
+├──────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  Queue #1247  ·  Bài: "A Novel Approach to Vietnamese NLP..."            │
+│  ════════════════════════════════════════════════════════════════════    │
+│                                                                          │
+│   ┌──── BÊN TRÁI: TÁC GIẢ SCOPUS ──────┐ ┌──── BÊN PHẢI: GV ICTU ────┐ │
+│   │                                       │ │                            │ │
+│   │  Authors: "Nguyen T.-T., Tran V.K."  │ │  ✅ Gợi ý: L001            │ │
+│   │  Author IDs: "58035626100; 5718901"   │ │     Nguyễn Trung T.        │ │
+│   │  Title:    "A Novel Approach to..."   │ │     Khoa: CNTT             │ │
+│   │  Year:     2026                       │ │     scopus_author_id:      │ │
+│   │  DOI:      10.1109/ABC.2026.123      │ │       58035626100 ✅       │ │
+│   │  Publisher: IEEE                      │ │                            │ │
+│   │  Document Type: Article               │ │  Match Score: 0.92 ████░   │ │
+│   │                                       │ │  Ngưỡng: HIGH (≥ 0.85)    │ │
+│   └───────────────────────────────────────┘ └────────────────────────────┘ │
+│                                                                          │
+│   ┌──── BẰNG CHỨNG ĐỐI CHIẾU (evidence_payload) ──────────────────┐    │
+│   │  ✅ Author ID match     (1.00)                                   │    │
+│   │  ✅ Name match          (0.95)   ████████▓░                      │    │
+│   │  ✅ Affiliation match   (1.00)   "ICTU - Hanoi"                  │    │
+│   │  ⚠️  Common name flag   (false)  "Nguyen" là họ phổ biến        │    │
+│   │  ⚠️  Document Type: Article (không có cờ Retracted)              │    │
+│   └──────────────────────────────────────────────────────────────────┘    │
+│                                                                          │
+│   ┌─────────────────────────────────────────────────────────────────┐    │
+│   │  [✅ Phê duyệt]  [✏️ Gán tay]  [⏸ Chờ xác minh]  [↩ Rollback]│    │
+│   └─────────────────────────────────────────────────────────────────┘    │
+│                                                                          │
+│  ◀ Trước (1246)  ●●●●● 1247  ●●●●● 1248  ●●●●● 1249  ●●●●● 1250  Sau ▶│
+│                                                                          │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+| Layout zone | Component | Hành vi / Trạng thái |
+|---|---|---|
+| Filter bar | 3 dropdown lọc + ô tìm kiếm | Mặc định sort theo `status DESC (HIGH → PENDING)` rồi `created_at ASC` |
+| Header | Tiêu đề bài báo + queue_id | Click → mở bài Scopus gốc ở tab mới |
+| Diff zone | 2 cột song song (Trước/Sau) | Cột trái: `raw_scopus_data`; cột phải: `lecturers` được gợi ý |
+| Evidence panel | 4 dòng điểm bằng chứng kèm progress bar | `is_common_name=true` → cảnh báo vàng; `is_retracted=true` → banner đỏ toàn màn hình |
+| Action bar | 4 nút (Duyệt, Gán tay, Defer, Rollback) | Rollback bị disable khi bản ghi chưa từng duyệt hoặc quá 72h |
+| Pagination | ◀ / ●●● / ▶ để chuyển bản ghi | Hỗ trợ phím tắt `J` (next), `K` (prev), `A` (approve) |
+
+### 8.3. Màn hình 3 — Thống kê & Kết xuất báo cáo
+
+**Mục đích:** Operator/Admin lọc dữ liệu chuẩn hoá, xem dashboard, xuất Excel/CSV/JSON có ký số (FR-23 → FR-29).
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│ ICTU · Báo cáo & Xuất dữ liệu          Op: nguyen.vanA  [Đăng xuất]      │
+├──────────────────────────────────────────────────────────────────────────┤
+│ [1 Upload]  [2 Approval Queue]  [3 Báo cáo●]  [4 Audit Log]              │
+├──────────────────────────────────────────────────────────────────────────┤
+│  BỘ LỌC                                                                  │
+│  ─────                                                                   │
+│  Năm:    [▼ Từ: 2024 ] [▼ Đến: 2026 ]                                   │
+│  Khoa:   [▼ CNTT                ]   Bộ môn: [▼ Tất cả          ]        │
+│  Publisher Family: [▼ Springer + IEEE + Elsevier + Khác ]                │
+│  Trạng thái:    [☑ APPROVED] [☐ PENDING_VERIFY] [☐ INVALIDATED]        │
+│  Từ khoá:       [_____________________________________________]          │
+│                                                                          │
+│  [ Áp dụng bộ lọc ]   [ Đặt lại ]    Preview: 312 dòng sẽ xuất          │
+│                                                                          │
+├──────────────────────────────────────────────────────────────────────────┤
+│  DASHBOARD TỔNG QUAN (Tuỳ chọn filter)                                  │
+│  ─────────────────────                                                   │
+│   ┌────────────┐  ┌────────────┐  ┌────────────┐  ┌────────────┐         │
+│   │    312     │  │  4,521     │  │   TOP 1    │  │   TOP 1    │         │
+│   │  Tổng bài  │  │  Trích dẫn │  │  Nguyễn T. │  │ Springer   │         │
+│   │  (lọc)     │  │  (lọc)     │  │  45 bài    │  │ 156 bài    │         │
+│   └────────────┘  └────────────┘  └────────────┘  └────────────┘         │
+│                                                                          │
+│   Phân bố Match Score:  HIGH ████████ 245  MEDIUM ███ 52  PEND █ 15      │
+│                                                                          │
+├──────────────────────────────────────────────────────────────────────────┤
+│  BẢNG XEM TRƯỚC (10 dòng đầu)                                          │
+│  ─────────────────────                                                   │
+│  # │ Mã GV    │ Họ tên          │ Năm │ Publisher │ Score │ Trạng thái    │
+│ ───┼──────────┼─────────────────┼──────┼───────────┼───────┼──────────     │
+│  1 │ L001     │ Nguyễn Trung T. │ 2026 │ Springer  │ 0.92  │ APPROVED     │
+│  2 │ L002     │ Trần Văn K.     │ 2026 │ IEEE      │ 0.89  │ APPROVED     │
+│  3 │ L014     │ Lê Hoàng M.     │ 2025 │ Elsevier  │ 0.81  │ APPROVED     │
+│  ...│ ...      │ ...             │ ...  │ ...       │ ...   │ ...           │
+│ 10 │ L008     │ Phạm Thị H.     │ 2024 │ Springer  │ 0.78  │ APPROVED     │
+│                                                                          │
+│  Hiển thị 1-10 / 312  ◀ Trang 1 / 32 ▶                                  │
+│                                                                          │
+├──────────────────────────────────────────────────────────────────────────┤
+│  XUẤT BÁO CÁO                                                            │
+│  ─────────────                                                            │
+│  [📊 Xuất Excel (.xlsx)]  [📄 Xuất CSV (.csv)]  [🔧 Xuất JSON (.json)]    │
+│                                                                          │
+│  Mỗi file xuất được ký số SHA-256 và ghi EXPORT_AUDIT_LOG               │
+│                                                                          │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+| Layout zone | Component | Hành vi / Trạng thái |
+|---|---|---|
+| Filter panel | 5 control (Năm từ/đến, Khoa, Bộ môn, Publisher Family multi-select, Status checkboxes, Từ khoá) | Click "Áp dụng" → gọi `/api/v1/standardized-data?filter=...` |
+| Preview count | Hiển thị số dòng sẽ xuất | Realtime theo filter |
+| Dashboard cards | 4 thẻ tổng quan + 1 biểu đồ thanh phân bố | Gọi `/api/v1/statistics/overview` |
+| Preview table | 10 dòng đầu của bộ lọc | Phân trang ◀ ▶ |
+| Export buttons | 3 nút xuất | Gọi `/api/v1/exports` (POST) → nhận `export_id` → polling `/api/v1/exports/{id}` cho đến khi `status=DONE` → tải file |
+
+---
+
+## 9. ĐỊNH DẠNG TRAO ĐỔI DỮ LIỆU (DATA EXCHANGE SPECS)
+
+Định dạng trao đổi phục vụ **tích hợp liên thông** với các hệ thống khác của ICTU và đảm bảo **tương thích đa công cụ** theo NFR-05 (MS Excel 2019+, Google Sheets, JSON Schema công bố).
+
+### 9.1. JSON Schema — Xuất báo cáo (NFR-05)
+
+Đặc tả JSON Schema dưới đây tuân thủ **JSON Schema Draft 2020-12**, có thể validate bằng `jsonschema` (Python), `ajv` (Node.js), hoặc `python -m json.tool` sau khi export.
+
+```json
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ictu.edu.vn/schemas/scopus-ictu-export.schema.json",
+  "title": "Scopus ICTU Export",
+  "description": "Đặc tả JSON Schema cho file xuất báo cáo chuẩn hoá Scopus ICTU. Tuân thủ NFR-05.",
+  "version": "1.0.0",
+  "type": "object",
+  "required": ["metadata", "articles"],
+  "additionalProperties": false,
+  "properties": {
+    "metadata": {
+      "type": "object",
+      "required": ["schema_version", "generated_at", "actor", "filter_criteria", "row_count", "file_hash_sha256"],
+      "properties": {
+        "schema_version": {
+          "type": "string",
+          "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$",
+          "description": "Phiên bản JSON Schema, dùng để tương thích ngược"
+        },
+        "generated_at": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Thời điểm xuất file (ISO 8601)"
+        },
+        "actor": {
+          "type": "object",
+          "required": ["user_id", "username"],
+          "properties": {
+            "user_id": { "type": "integer", "minimum": 1 },
+            "username": { "type": "string", "minLength": 1 },
+            "role": { "type": "string", "enum": ["operator", "admin"] }
+          }
+        },
+        "filter_criteria": {
+          "type": "object",
+          "description": "Bộ lọc đã dùng để xuất báo cáo",
+          "properties": {
+            "year_from": { "type": "integer", "minimum": 1900, "maximum": 2100 },
+            "year_to": { "type": "integer", "minimum": 1900, "maximum": 2100 },
+            "faculty": { "type": "string" },
+            "publisher_family": {
+              "type": "array",
+              "items": { "type": "string", "enum": ["Springer", "IEEE", "Elsevier", "Other"] }
+            },
+            "status": { "type": "string", "enum": ["APPROVED", "PENDING_VERIFY", "INVALIDATED"] },
+            "keyword": { "type": "string" }
+          }
+        },
+        "row_count": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Số bản ghi trong file (= articles.length)"
+        },
+        "file_hash_sha256": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$",
+          "description": "Hash SHA-256 của toàn bộ file (ký số NFR-05)"
+        }
+      }
+    },
+    "articles": {
+      "type": "array",
+      "description": "Danh sách bài báo đã chuẩn hoá",
+      "items": {
+        "type": "object",
+        "required": ["eid", "title", "year", "lecturer", "match_score", "approved_at"],
+        "properties": {
+          "eid": { "type": "string", "description": "Mã EID Scopus" },
+          "doi": { "type": ["string", "null"] },
+          "title": { "type": "string", "minLength": 1 },
+          "authors": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Danh sách tên tác giả viết tắt không dấu từ Scopus"
+          },
+          "year": { "type": "integer", "minimum": 1900, "maximum": 2100 },
+          "source_title": { "type": ["string", "null"] },
+          "publisher": { "type": ["string", "null"] },
+          "publisher_family": {
+            "type": "string",
+            "enum": ["Springer", "IEEE", "Elsevier", "Other"],
+            "description": "Nhóm nhà xuất bản (FR-23)"
+          },
+          "document_type": { "type": "string" },
+          "cited_by": { "type": "integer", "minimum": 0 },
+          "lecturer": {
+            "type": "object",
+            "required": ["id", "lecturer_code", "full_name"],
+            "properties": {
+              "id": { "type": "integer" },
+              "lecturer_code": { "type": "string", "pattern": "^L[0-9]{3,}$" },
+              "full_name": { "type": "string" },
+              "faculty": { "type": ["string", "null"] },
+              "department": { "type": ["string", "null"] },
+              "scopus_author_id": { "type": ["string", "null"] }
+            }
+          },
+          "match_score": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "description": "Match Score ∈ [0,1] (FR-12)"
+          },
+          "evidence_payload": {
+            "type": "object",
+            "description": "Căn cứ đối chiếu dùng cho kiểm toán",
+            "properties": {
+              "author_id_match": { "type": "boolean" },
+              "name_score": { "type": "number", "minimum": 0, "maximum": 1 },
+              "affiliation_score": { "type": "number", "minimum": 0, "maximum": 1 },
+              "common_name_flag": { "type": "boolean" }
+            }
+          },
+          "approved_at": { "type": "string", "format": "date-time" },
+          "approved_by": { "type": "string" }
+        }
+      }
+    }
+  }
+}
+```
+
+**Quy tắc sử dụng:**
+
+- `metadata.file_hash_sha256` được tính trên toàn bộ `articles` array (serialize JSON, không tính trên metadata chứa chính hash đó) → đảm bảo không tự tham chiếu.
+- File xuất phải có `metadata.schema_version` để các hệ thống tiêu thụ có thể đối chiếu khi schema nâng cấp.
+- Mọi file JSON trước khi phát hành phải được validate bằng `python -m jsonschema -i export.json scopus-ictu-export.schema.json` và kết quả là PASS 100% (AC-05.03).
+
+### 9.2. Quy định cấu trúc bảng tính Excel xuất nhiều sheet
+
+File `.xlsx` xuất ra phải tuân thủ cấu trúc **4 sheet** sau (FR-26), có Data Validation, không chứa macro, mở được bằng MS Excel 2019+.
+
+#### Sheet 1 — `Summary`
+
+| Cột | Header | Kiểu | Mô tả |
+|---|---|---|---|
+| A | `Metric` | Text | Tên chỉ số tổng quan |
+| B | `Value` | Number | Giá trị tương ứng |
+| C | `Note` | Text | Ghi chú (nullable) |
+
+**Các dòng dữ liệu mẫu:**
+
+| Metric | Value | Note |
+|---|---|---|
+| `Tổng số bài (lọc)` | 312 | Theo bộ lọc đã chọn |
+| `Tổng trích dẫn` | 4521 | |
+| `Số giảng viên ICTU` | 47 | Có ≥ 1 bài trong kỳ |
+| `Số bài HIGH (≥ 0.85)` | 245 | |
+| `Số bài MEDIUM (0.50–0.85)` | 52 | |
+| `Số bài PENDING (< 0.50)` | 15 | Cần Admin xử lý |
+| `Ngày xuất` | 2026-09-26 | |
+| `Người xuất` | nguyen.vanA | |
+| `Schema version` | 1.0.0 | |
+
+#### Sheet 2 — `Standardized_Articles`
+
+| Cột | Header | Kiểu | Nguồn dữ liệu |
+|---|---|---|---|
+| A | `STT` | Integer | Thứ tự |
+| B | `EID` | Text | `raw_scopus_data.eid` |
+| C | `DOI` | Text | `raw_scopus_data.doi` |
+| D | `Title` | Text | `raw_scopus_data.title` |
+| E | `Authors` | Text | `raw_scopus_data.authors` |
+| F | `Year` | Integer | `raw_scopus_data.year` |
+| G | `Publisher` | Text | `raw_scopus_data.publisher` |
+| H | `Publisher Family` | Text (Validation: Springer/IEEE/Elsevier/Other) | Mapping từ `publisher` |
+| I | `Document Type` | Text | `raw_scopus_data.document_type` |
+| J | `Cited By` | Integer | `raw_scopus_data.cited_by` |
+| K | `Lecturer Code` | Text | `lecturers.lecturer_code` |
+| L | `Lecturer Name` | Text | `lecturers.full_name` |
+| M | `Faculty` | Text | `lecturers.faculty` |
+| N | `Match Score` | Decimal (0.000–1.000) | `standardized_data.match_score` |
+| O | `Evidence Summary` | Text (rút gọn từ JSONB) | `evidence_payload` |
+| P | `Approved At` | DateTime | `standardized_data.approved_at` |
+| Q | `Approved By` | Text | `users.username` |
+| R | `Status` | Text (Validation: APPROVED/PENDING_VERIFY/INVALIDATED) | |
+
+#### Sheet 3 — `Lecturer_Stats`
+
+| Cột | Header | Kiểu | Mô tả |
+|---|---|---|---|
+| A | `STT` | Integer | |
+| B | `Lecturer Code` | Text | |
+| C | `Full Name` | Text | |
+| D | `Faculty` | Text | |
+| E | `Total Articles` | Integer | Đếm từ `standardized_data` (active) |
+| F | `Total Citations` | Integer | Tổng `cited_by` |
+| H | `First Article Year` | Integer | |
+| I | `Latest Article Year` | Integer | |
+| J | `Top Publisher Family` | Text | Nhóm NXB xuất hiện nhiều nhất |
+
+**Sắp xếp mặc định:** DESC theo `Total Articles`.
+
+#### Sheet 4 — `Audit_Trail`
+
+| Cột | Header | Kiểu | Mô tả |
+|---|---|---|---|
+| A | `STT` | Integer | |
+| B | `Timestamp` | DateTime | `audit_log.created_at` |
+| C | `Action` | Text | APPROVE / MANUAL_OVERRIDE / DEFER / ROLLBACK |
+| D | `Actor` | Text | `users.username` |
+| E | `Target Table` | Text | `standardized_data` |
+| F | `Target ID` | Integer | `audit_log.target_id` |
+| G | `Before (JSON)` | Text | `before_json` (rút gọn nếu dài) |
+| H | `After (JSON)` | Text | `after_json` |
+| I | `Reason` | Text | `audit_log.reason` |
+| J | `Correlation ID` | Text (UUID) | `audit_log.correlation_id` |
+
+#### Quy tắc chung cho Excel
+
+| Quy tắc | Mô tả |
+|---|---|
+| **Encoding** | UTF-8 with BOM để Excel nhận diện đúng tiếng Việt có dấu |
+| **Header** | In đậm, có Data Validation với danh sách giá trị cho các cột enum |
+| **Freeze pane** | Sheet 2–4: freeze ô `B2` (header + cột STT) |
+| **Số dòng tối đa** | 100 000 / sheet; vượt → chia nhỏ thành nhiều file + ZIP (FR-26 + A2 Màn hình 3) |
+| **Tên file** | `Scopus_ICTU_<filter>_<yyyymmdd>_<hash>.xlsx` |
+| **Sheet Protection** | Sheet 2–4 không có; chỉ freeze + validation |
+| **Macro** | KHÔNG chứa VBA macro (NFR-05) |
+| **File size** | Nếu > 100 MB → chia file_001.xlsx, file_002.xlsx,... đóng gói ZIP |
+
+### 9.3. Định dạng CSV (FR-27)
+
+| Quy tắc | Giá trị |
+|---|---|
+| Encoding | UTF-8 with BOM (`EF BB BF`) |
+| Delimiter | Dấu phẩy `,` |
+| Quote | Dấu nháy kép `"` |
+| Line ending | CRLF (`\r\n`) |
+| Header | Dòng đầu tiên, đúng thứ tự cột của Sheet 2 |
+| Tên file | `Scopus_ICTU_<filter>_<yyyymmdd>_<hash>.csv` |
+
+### 9.4. Tương thích đa công cụ (NFR-05)
+
+| Định dạng | Công cụ kiểm thử | Kỳ vọng |
+|---|---|---|
+| `.xlsx` | MS Excel 2019 / 2021 / 365 | Mở không lỗi, hiển thị đúng tiếng Việt, chạy được Data Validation |
+| `.xlsx` | LibreOffice Calc 7+ | Tương thích đầy đủ |
+| `.csv` | Microsoft Excel | Mở UTF-8, không hỏi encoding, đúng delimiter |
+| `.csv` | Google Sheets | Import không lỗi, cột đúng kiểu |
+| `.json` | `python -m json.tool` | Parse không lỗi |
+| `.json` | `jsonschema` validator | Validate theo Schema PASS 100% |
+
+---
+
+## 10. TỔNG HỢP TIÊU CHÍ NGHIỆM THU TUẦN 3
+
+Bảng dưới đây liệt kê các tiêu chí nghiệm thu kỹ thuật cần đạt được sau khi triển khai các nhiệm vụ Tuần 3.
+
+| STT | Tiêu chí | Phương pháp kiểm thử | Đạt/Không đạt |
+|---|---|---|---|
+| 1 | Migration SQL chạy không lỗi trên PostgreSQL 15 | Chạy `\i schema.sql` trên DB trống; xác nhận 10 bảng được tạo | ☐ |
+| 2 | Idempotency hoạt động (NFR-01) | Insert 2 lần cùng EID → lỗi UNIQUE violation | ☐ |
+| 3 | Audit log bất biến (NFR-02) | Với role `app_backend`, thử UPDATE/DELETE bản ghi `audit_log` → bị từ chối | ☐ |
+| 4 | API upload trả 201 với batch_id | Gửi POST `/api/v1/uploads` với file mẫu; kiểm tra response | ☐ |
+| 5 | API trả 403 cho Operator gọi endpoint admin | Gửi POST `/api/v1/approval-queue/.../approve` với token Operator; kiểm tra 403 + log SECURITY_AUDIT_LOG | ☐ |
+| 6 | Rollback bị từ chối sau 72h | Gửi POST `/api/v1/standardized-data/{id}/rollback` với bản ghi đã duyệt 73h trước; kiểm tra 409 | ☐ |
+| 7 | JSON export validate theo Schema PASS 100% | `jsonschema -i export.json scopus-ictu-export.schema.json` | ☐ |
+| 8 | Excel mở được bằng MS Excel 2019+ | Mở file xlsx; kiểm tra không lỗi encoding | ☐ |
+| 9 | CSV mở được bằng Google Sheets | Import vào Google Sheets; kiểm tra cột và dòng đúng | ☐ |
+| 10 | UI Wireframe 3 màn hình hiển thị đúng layout | Build React từ mockup; kiểm tra các zone và component khớp ASCII | ☐ |
+
+---
+
+*— Hết tài liệu TUAN3.MD —*
