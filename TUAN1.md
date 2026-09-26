@@ -127,31 +127,15 @@
 
 | Khía cạnh | Đánh giá | Căn cứ |
 |---|---|---|
-| **Cấu trúc 22 trường** | ✅ Ổn định | Toàn bộ 660 dòng tuân thủ schema, 0 lỗi parse |
-| **Khóa định danh tác giả** | ✅ Tuyệt vời | 100% có `Author(s) ID` |
-| **Khóa định danh bài báo** | ✅ Tuyệt vời | 100% có EID; cho phép Idempotency |
-| **Khóa định danh năm** | ✅ Tuyệt vời | 100% có Year |
-| **DOI** | ⚠️ Thiếu 3,79% | Cần cơ chế cảnh báo dòng |
-| **Open Access** | ⚠️ Thiếu 73,8% | Không ảnh hưởng nghiệp vụ chính |
-| **Trường tên tiếng Việt** | ⚠️ Cần chuẩn hoá | Tên trong `Authors` viết tắt không dấu, cần parse + normalize |
-| **Retracted / Erratum** | ⚠️ Cần cờ cảnh báo | 4 bản ghi phải đánh dấu để loại khỏi báo cáo kiểm định |
+| **Cấu trúc 22 trường** |  Ổn định | Toàn bộ 660 dòng tuân thủ schema, 0 lỗi parse |
+| **Khóa định danh tác giả** |  Tuyệt vời | 100% có `Author(s) ID` |
+| **Khóa định danh bài báo** |  Tuyệt vời | 100% có EID; cho phép Idempotency |
+| **Khóa định danh năm** |  Tuyệt vời | 100% có Year |
+| **DOI** |  Thiếu 3,79% | Cần cơ chế cảnh báo dòng |
+| **Open Access** |  Thiếu 73,8% | Không ảnh hưởng nghiệp vụ chính |
+| **Trường tên tiếng Việt** |  Cần chuẩn hoá | Tên trong `Authors` viết tắt không dấu, cần parse + normalize |
+| **Retracted / Erratum** |  Cần cờ cảnh báo | 4 bản ghi phải đánh dấu để loại khỏi báo cáo kiểm định |
 
 **Kết luận khảo sát:** Dữ liệu **đủ tốt để tự động hoá phần lớn** (Idempotency, parse tác giả, đối soát qua Author ID). Chỉ **4 trường hợp đặc biệt** cần xử lý riêng: 25 bài khuyết DOI, 4 bài Retracted/Erratum, 487 bài khuyết OA flag, 15 bài ≥ 10 tác giả — toàn bộ đều đã được tính trước trong **logic ngưỡng Match Score** (PI 2.1) và **giao diện Diff của Admin** (PI 3.3).
 
 ---
-
-## 8. Đề xuất chức năng hệ thống từ kết quả khảo sát
-
-| # | Chức năng đề xuất | Căn cứ thực tế | Mapping PI |
-|---|---|---|---|
-| 1 | **Idempotency check qua EID** trước khi insert RAW_DATA | 100% bản ghi có EID | PI 1.1 |
-| 2 | **So khớp chính xác qua Author(s) ID** làm bước đầu tiên | 100% có Author ID | PI 2.1 |
-| 3 | **Fuzzy match qua tên tiếng Việt không dấu + Affiliation** làm bước 2 | Tên `Authors` viết tắt không dấu | PI 2.1 |
-| 4 | **Ngưỡng 85/50% + cờ cảnh báo Retracted/Erratum** trong giao diện duyệt | 4 bài bất thường + 15 bài ≥ 10 tác giả | PI 3.3 |
-| 5 | **Bộ lọc thống kê theo publisher family** (Springer, IEEE, Elsevier, Khác) | 3 publisher gốc chiếm ~92% | PI 3.4 |
-| 6 | **Cảnh báo dòng (không dừng luồng)** cho 25 bài khuyết DOI | 3,79% dữ liệu thiếu DOI | PI 1.2 |
-
----
-
-*File sinh kèm: `scopus-ictu-overview-flow.md` (sơ đồ tổng quan Mermaid 6 bước vừa nửa trang Word).*
-*Tham chiếu chéo: xem `scopus-ictu-swimlane.puml` (chi tiết 4 giai đoạn), `scopus-ictu-approval.ir.json` (BPMN 2.0), `scopus-ictu-process-spec.md` (đặc tả bước).*
