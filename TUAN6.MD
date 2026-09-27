@@ -2,7 +2,8 @@
 
 **Đề tài:** Hệ thống Quản lý và Chuẩn hóa Hồ sơ Scopus ICTU
 **Giai đoạn:** Tuần 6 — Approval Workflow + Diff View + Audit bất biến + Rollback 72h
-**Sinh viên:** Trương Quang Huy
+**Sinh viên:** Trương Quang Huy — MSSV: DTC235200899 — Lớp: CN CNTT K22A
+**Giảng viên hướng dẫn:** TS. Nguyễn Thế Vinh — Bộ môn Công nghệ phần mềm, Khoa Công nghệ thông tin (ICTU)
 **Trường:** Đại học CNTT & Truyền thông Thái Nguyên (ICTU)
 **Ngày cập nhật:** 27/09/2026
 
